@@ -40,10 +40,10 @@
 1. 查每个机型在哪些 AZ 有，没有的跳过。
 2. 检查有没有读取预留的权限，没有就停。
 3. 每一轮，按你给的机型顺序、在每个 AZ 里申请剩下的全部数量；碰到 `InsufficientInstanceCapacity` 就减半（4 → 2 → 1，除了最后几台，不会低于 `--min-chunk`）。
-4. 返回 `active` 或 `pending` 都算抢到。因为最终一致性，`pending` 最多可能持续约 5 分钟，脚本不会取消它。返回 `failed` 不算。
-5. 用 `AWS_MAX_ATTEMPTS=1` 调 CLI（不让 CLI 偷偷重试），每个请求都带一个唯一的 `ClientToken`。碰到网络错误、5xx 这类"不知道成没成功"的情况，就把**同一个**请求再发一次，所以响应丢了也不会多建一个预留。
+4. 返回 `active` 或 `pending` 都算抢到。因为最终一致性，`pending` 最多可能持续约 5 分钟，脚本不会取消它。返回 `failed` 不算。pending 的预留之后会再查：如果变成 `failed`，就把数量加回去继续抢。宣布"抢满"之前，最多等 6 分钟让 pending 的结果出来。
+5. 用 `AWS_MAX_ATTEMPTS=1` 调 CLI（不让 CLI 偷偷重试），每个请求都带一个唯一的 `ClientToken`。碰到网络错误、5xx 这类"不知道成没成功"的情况，就把**同一个**请求最多再发 2 次，所以响应丢了也不会多建一个预留。如果还是不清楚，这一轮就不再发新请求。
 6. 每轮开始前去 AWS 查这次运行（tag `gpu-hunter-run`）已经拿到了多少台。因为查询是最终一致的，这个数字只用来**调低**剩余数量，不会调高。
-7. 轮与轮之间：每次一无所获就把等待时间乘 1.5，从 `--interval`（30 秒）到 `--max-interval`（300 秒），加随机抖动；碰到限流就直接等最长时间。
+7. 轮与轮之间：每次一无所获就把等待时间乘 1.5，从 `--interval`（30 秒）到 `--max-interval`（300 秒），加随机抖动；碰到限流就马上停止这一轮，等最长时间再来。
 8. 碰到配额、权限、参数错误马上停。
 9. 每次尝试都在 CSV 里记一行，结束时打印一行统计。
 
@@ -66,8 +66,8 @@
 ./gpu-hunter.sh -r eu-central-1 --status
 ./gpu-hunter.sh -r eu-central-1 --release
 
-# 4. 汇总一次运行的结果
-tools/report.sh gpu-hunter-events-<run id>.csv
+# 4. 汇总一次运行的结果（默认用当前目录里最新的事件文件）
+tools/report.sh
 ```
 
 参数、退出码和环境变量见 [README.md](README.md)。

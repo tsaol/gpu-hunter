@@ -83,14 +83,21 @@ our_reservations() {
     --output text
 }
 
+if [[ "$MODE" == "status" || "$MODE" == "release" ]]; then
+  if ! list=$(our_reservations 2>&1); then
+    echo "ERROR: cannot list Capacity Reservations in $REGION (credentials, region or ec2:DescribeCapacityReservations?):"
+    echo "$list"
+    exit 3
+  fi
+fi
 if [[ "$MODE" == "status" ]]; then
   echo "Reservations tagged gpu-hunter=$TAG in $REGION (id type az total free state):"
-  our_reservations
+  [[ -n "$list" ]] && echo "$list"
   exit 0
 fi
 
 if [[ "$MODE" == "release" ]]; then
-  ids=$(our_reservations | awk '{print $1}'); rc_rel=0
+  ids=$(awk '{print $1}' <<<"$list"); rc_rel=0
   [[ -z "$ids" ]] && { echo "nothing to release"; exit 0; }
   for id in $ids; do
     if out=$(aws ec2 cancel-capacity-reservation --region "$REGION" --capacity-reservation-id "$id" 2>&1 >/dev/null); then
@@ -107,7 +114,9 @@ fi
 [[ -z "$TYPES" ]] && { echo "need -t <types>"; usage 1; }
 for v in TARGET:1 MIN_CHUNK:1 INTERVAL:1 MAX_INTERVAL:1 MAX_HOURS:0; do
   name=${v%%:*}; min=${v##*:}; val=${!name}
-  [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min )) || { echo "$name must be a whole number >= $min (got '$val')"; exit 1; }
+  [[ "$val" =~ ^[0-9]+$ ]] || { echo "$name must be a whole number >= $min (got '$val')"; exit 1; }
+  val=$((10#$val)); printf -v "$name" '%d' "$val"     # '010' means 10, not octal 8
+  (( val >= min )) || { echo "$name must be a whole number >= $min (got '$val')"; exit 1; }
 done
 (( MAX_INTERVAL < INTERVAL )) && MAX_INTERVAL=$INTERVAL
 IFS=',' read -ra TYPE_LIST <<< "$TYPES"
@@ -138,6 +147,9 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 REMAINING=$TARGET
 WAIT=$INTERVAL
 START=$(date +%s)
+PENDING=()                                   # "id count" of reservations won while still 'pending'
+PENDING_POLL="${GPU_HUNTER_PENDING_POLL:-15}"  # seconds between pending checks
+PENDING_MAX="${GPU_HUNTER_PENDING_MAX:-360}"   # docs: state can take up to ~5 min to show 'active'
 THROTTLE_SEEN=0; N_TRY=0; N_ICE=0; N_THROTTLE=0; N_WIN=0; T_FIRST=""; T_FULL=""
 [[ -s "$EVENTS" ]] || echo "time_utc,elapsed_s,round,type,az,count,result,api_ms" > "$EVENTS"
 event() {  # type az count result api_ms
@@ -160,7 +172,12 @@ reserved_so_far() {
     --query 'sum(CapacityReservations[].TotalInstanceCount)' --output text 2>/dev/null
 }
 
-# try_reserve TYPE AZ COUNT -> 0 ok, 1 no capacity (retry later), 2 fatal
+is_unclear() {  # rc out -> 0 if we can't tell whether AWS applied the request
+  [[ $1 -ne 0 && "$2" =~ (Could\ not\ connect|timed\ out|Read\ timeout|Connect\ timeout|EndpointConnectionError|InternalError|ServiceUnavailable|Unavailable) ]]
+}
+
+# try_reserve TYPE AZ COUNT -> 0 won, 1 no capacity (try smaller / elsewhere),
+#                              2 fatal, 3 stop this round now (throttled, or result unclear)
 try_reserve() {
   local t="$1" z="$2" c="$3" out rc
   local args=(ec2 create-capacity-reservation --region "$REGION" --instance-type "$t"
@@ -173,17 +190,19 @@ try_reserve() {
   # request again returns the original result instead of creating a second reservation.
   args+=(--client-token "gh-$RUN_ID-$N_TRY-$RANDOM")
   # AWS_MAX_ATTEMPTS=1: no hidden CLI retries, our own backoff sets the pace
-  local t0 ms
-  local k
-  t0=$(date +%s%N)
-  for k in 1 2 3; do
+  local t0 ms k=0
+  while :; do
+    t0=$(date +%s%N)
     out=$(AWS_MAX_ATTEMPTS=1 aws "${args[@]}" 2>&1); rc=$?
-    # only an unclear result (network / 5xx) is re-sent, with the same ClientToken
-    [[ $rc -ne 0 && "$out" =~ (Could\ not\ connect|timed\ out|Read\ timeout|Connect\ timeout|EndpointConnectionError|InternalError|ServiceUnavailable|Unavailable) ]] || break
-    log "unclear result ($(head -c 80 <<<"$out")...), re-sending the same request (try $k)"
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))       # latency of this one call only
+    # only an unclear result (network / 5xx) is re-sent, with the same ClientToken, at most 2 times
+    is_unclear "$rc" "$out" || break
+    (( k >= 2 )) && break
+    k=$((k+1))
+    log "unclear result ($(head -c 80 <<<"$out")...), re-sending the same request ($k of 2)"
     sleep $((k * 2))
   done
-  ms=$(( ($(date +%s%N) - t0) / 1000000 )); N_TRY=$((N_TRY+1))
+  N_TRY=$((N_TRY+1))
   if [[ $rc -eq 0 ]]; then
     read -r LAST_ID LAST_STATE <<<"$out"
     # 'pending' is normal: the API is eventually consistent and the state can take
@@ -191,6 +210,7 @@ try_reserve() {
     if [[ "$LAST_STATE" == "failed" ]]; then
       N_ICE=$((N_ICE+1)); event "$t" "$z" "$c" failed-state "$ms"; return 1
     fi
+    [[ "$LAST_STATE" == "pending" ]] && PENDING+=("$LAST_ID $c")
     event "$t" "$z" "$c" "won-$LAST_STATE" "$ms"; return 0
   fi
   case "$out" in
@@ -198,10 +218,12 @@ try_reserve() {
     *InsufficientInstanceCapacity*|*InsufficientCapacity*)
       N_ICE=$((N_ICE+1)); event "$t" "$z" "$c" no-capacity "$ms"; return 1;;
     *RequestLimitExceeded*|*Throttling*)
-      N_THROTTLE=$((N_THROTTLE+1)); event "$t" "$z" "$c" throttled "$ms"; return 1;;
+      N_THROTTLE=$((N_THROTTLE+1)); event "$t" "$z" "$c" throttled "$ms"; return 3;;
     *Unavailable*|*InternalError*|*"Could not connect"*|*"timed out"*|*"Read timeout"*|*"Connect timeout"*|*EndpointConnectionError*)
-      # the request may or may not have been applied; the next round re-reads the truth from AWS
-      event "$t" "$z" "$c" aws-or-network-error "$ms"; return 1;;
+      # it may or may not have been applied: send nothing new this round (that could
+      # over-reserve); the next round first re-reads from AWS what this run holds
+      log "result still unclear after 2 re-sends; stopping this round"
+      event "$t" "$z" "$c" aws-or-network-error "$ms"; return 3;;
     *InstanceLimitExceeded*|*ReservationCapacityExceeded*|*VcpuLimitExceeded*|*exceed*quota*|*LimitExceeded*)
       event "$t" "$z" "$c" quota "$ms"; log "FATAL quota: $out"; LAST_ERR="quota"; return 2;;
     *)
@@ -209,10 +231,31 @@ try_reserve() {
   esac
 }
 
+# check_pending: re-read 'pending' reservations; a failed one gives its count back to REMAINING
+check_pending() {
+  (( ${#PENDING[@]} == 0 )) && return 0
+  local keep=() e id cnt st
+  for e in "${PENDING[@]}"; do
+    read -r id cnt <<<"$e"
+    st=$(aws ec2 describe-capacity-reservations --region "$REGION" --capacity-reservation-ids "$id" \
+          --query 'CapacityReservations[0].State' --output text 2>/dev/null)
+    case "$st" in
+      active) log "pending $id is now active";;
+      failed|cancelled|expired)
+        REMAINING=$((REMAINING + cnt)); T_FULL=""
+        log "pending $id ended as '$st'; $cnt instance(s) back to hunt, remaining=$REMAINING";;
+      *) keep+=("$e");;
+    esac
+  done
+  PENDING=(${keep[@]+"${keep[@]}"})   # safe on bash 4.0-4.3 with set -u
+}
+
 log "start: run=$RUN_ID target=$TARGET types=$TYPES region=$REGION match=$MATCH dry_run=$DRY_RUN"
+while :; do                      # outer loop: hunt, then confirm 'pending' wins
 while (( REMAINING > 0 )); do
   ROUND=$((ROUND+1))
   won=0
+  check_pending
   if (( DRY_RUN == 0 && ROUND > 1 )); then
     have=$(reserved_so_far)
     # Only ever LOWER the remaining count: describe is eventually consistent, so a reservation
@@ -242,6 +285,8 @@ while (( REMAINING > 0 )); do
         elif [[ $r -eq 2 ]]; then
           notify "stopped ($LAST_ERR)" "Stopped with an error, see $LOG. Got so far: ${GOT[*]:-none}"
           exit 3
+        elif [[ $r -eq 3 ]]; then
+          break 3      # throttled or unclear: no more requests this round
         fi
         (( c == floor )) && break
         c=$((c / 2)); (( c < floor )) && c=$floor
@@ -259,6 +304,17 @@ while (( REMAINING > 0 )); do
   sleep_s=$(( WAIT + RANDOM % (WAIT / 3 + 1) ))
   log "round $ROUND: no more capacity now, remaining=$REMAINING, next try in ${sleep_s}s"
   sleep "$sleep_s"
+done
+# All counted. Before saying DONE, wait for 'pending' wins to settle (a pending one can still fail).
+waited=0
+while (( ${#PENDING[@]} > 0 && waited < PENDING_MAX )); do
+  log "waiting for ${#PENDING[@]} pending reservation(s) to become active (${waited}s so far)"
+  sleep "$PENDING_POLL"; waited=$((waited + PENDING_POLL)); check_pending
+  (( REMAINING > 0 )) && break
+done
+(( REMAINING > 0 )) && { log "back to hunting: remaining=$REMAINING"; continue; }
+(( ${#PENDING[@]} > 0 )) && log "WARN: ${#PENDING[@]} reservation(s) still 'pending' after ${PENDING_MAX}s; counted as won, check with --status"
+break
 done
 
 log "DONE: reserved $TARGET. ${GOT[*]}"

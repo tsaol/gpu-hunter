@@ -49,15 +49,19 @@ per-attempt log. See [docs/MECHANISM.md §4](docs/MECHANISM.md).
    never below `--min-chunk` except for the last few).
 4. A reservation returned as `active` or `pending` counts as won (state can stay
    `pending` for up to ~5 minutes due to eventual consistency; the script never
-   cancels it). One returned as `failed` does not count.
+   cancels it). One returned as `failed` does not count. Pending ones are checked
+   again; if one turns `failed`, its count goes back and the hunt continues.
+   Before it reports DONE it waits up to 6 minutes for pending ones to settle.
 5. Calls the CLI with `AWS_MAX_ATTEMPTS=1` (no hidden retries) and a unique
    `ClientToken` per request. On an unclear result (network error, 5xx) it
-   re-sends the **same** request, so a lost response can't create a second reservation.
+   re-sends the **same** request up to 2 times, so a lost response can't create a
+   second reservation. If it is still unclear, it sends nothing new in that round.
 6. Each round it re-reads from AWS how many instances this run holds
    (tag `gpu-hunter-run`). It only ever lowers the remaining count from that
    number, never raises it, because describe calls are eventually consistent.
 7. Between rounds: wait ×1.5 per empty round, from `--interval` (30 s) up to
-   `--max-interval` (300 s), plus jitter; on API throttling it waits the maximum.
+   `--max-interval` (300 s), plus jitter. On API throttling it stops the round at
+   once and waits the maximum.
 8. Stops at once on quota, permission or parameter errors.
 9. Writes one CSV line per attempt and a summary line at exit.
 
@@ -82,8 +86,8 @@ per-attempt log. See [docs/MECHANISM.md §4](docs/MECHANISM.md).
 ./gpu-hunter.sh -r eu-central-1 --status
 ./gpu-hunter.sh -r eu-central-1 --release
 
-# 4. summarise a run
-tools/report.sh gpu-hunter-events-<run id>.csv
+# 4. summarise a run (default: the newest events file in this folder)
+tools/report.sh
 ```
 
 | Option | Meaning | Default |
@@ -141,6 +145,7 @@ in the same account.
 tests/test.sh          # offline: a stateful fake aws CLI simulates no-capacity,
                        # failed / pending states, lost responses, quota, permission, bad input
 LIVE=1 tests/test.sh   # also one real --dry-run call (needs credentials, creates nothing)
+                       # takes about 30 s (some tests wait on purpose)
 ```
 
 What has and has not been verified is listed in [docs/MECHANISM.md §7.4](docs/MECHANISM.md).
