@@ -77,7 +77,7 @@ tools/report.sh gpu-hunter-events-<run id>.csv
 - **open 模式会吃掉正在跑的实例**：账号里已经有同机型、同平台、同 AZ 的实例的话，预留一生效它们就会占进来。不想这样就用 `--targeted`。
 - **API 限流是共用的**：`CreateCapacityReservation` 属于 mutating 操作，EC2 按账号 + 区域给所有 mutating 操作共用一个令牌桶（写这篇时是 50 个令牌，每秒补 5 个）。间隔太短会影响客户自己的自动化。见 [EC2 API throttling](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html)。
 - **每次没抢到都会留下一条 `failed` 记录**：不收费，不占配额，60 分钟后就看不到了。
-- **尽量在同一个区域里运行**（比如 CloudShell，或者在那个区域开一台小机器）：我们实测，本区域调用每次约 0.4 秒，跨区域约 1.3 秒。
+- **尽量在同一个区域里运行**（比如 CloudShell，或者在那个区域开一台小机器）：我们实测，查询请求在本区域约 0.4 秒、跨区域约 1.3 秒；创建请求只测过跨区域，约 1.3–1.5 秒。
 - 同一个 AZ 名字在不同账号里对应的物理 AZ 不一样，跨账号要用 AZ ID。
 - 脚本退出以后，就不会再管这些预留了。
 

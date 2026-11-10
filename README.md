@@ -122,7 +122,8 @@ Environment: `GPU_HUNTER_REGION`, `GPU_HUNTER_LOG` (default `./gpu-hunter.log`),
 - **Every no-capacity attempt leaves a `failed` reservation record.** It costs
   nothing, does not count against quota, and disappears from view after 60 minutes.
 - **Run it in the same Region** if you can (for example CloudShell or a small
-  instance there): in our test, a call took ~0.4 s in-Region and ~1.3 s cross-Region.
+  instance there): in our test, a describe call took ~0.4 s in-Region and ~1.3 s
+  cross-Region (create calls were only measured cross-Region, ~1.3–1.5 s).
 - AZ names map to different physical AZs in each account. Across accounts, use AZ IDs.
 - The script does not watch reservations after it exits.
 
