@@ -69,7 +69,7 @@ case "$*" in
 esac
 F
 chmod +x "$tmp/bin/aws"
-run() { rm -rf "$FAKE_DIR" "$tmp"/gpu-hunter-events-*.csv; (cd "$tmp" && PATH="$tmp/bin:$PATH" FAKE_MODE="$1" GPU_HUNTER_PENDING_POLL=1 GPU_HUNTER_PENDING_MAX=5 timeout "${T:-60}" "$H" -r zz-test-1 "${@:2}" 2>&1); }
+run() { rm -rf "$FAKE_DIR" "$tmp"/gpu-hunter-events-*.csv; (cd "$tmp" && PATH="$tmp/bin:$PATH" FAKE_MODE="$1" GPU_HUNTER_PENDING_POLL=1 GPU_HUNTER_PENDING_MAX=5 timeout "${T:-60}" "$H" -r zz-test-1 --i-understand-this-is-a-demo "${@:2}" 2>&1); }
 
 out=$(run ice-then-small -t g6e.12xlarge -n 4 -i 1 --max-interval 2); rc=$?
 [[ $rc -eq 0 && "$out" == *"DONE: reserved 4"* ]] && ok "retries + halving reach the target" || { bad "retries + halving (rc=$rc)"; echo "$out"; }
@@ -122,21 +122,25 @@ out=$(run lost -t g6.xlarge -n 2 -i 1 --max-interval 1); maxms=$(tail -n +2 "$tm
 # octal: -n 010 means 10
 out=$(run chunk -t g6.xlarge -n 010 -i 1 --max-interval 1); [[ "$out" == *"target=10 "* ]] && ok "-n 010 is read as 10" || { bad "octal"; echo "$out" | head -3; }
 
+# demo guard: without the flag a real (non dry-run) run refuses and creates nothing
+rm -rf "$FAKE_DIR"; out=$(cd "$tmp" && PATH="$tmp/bin:$PATH" FAKE_MODE=chunk timeout 10 "$H" -r zz-test-1 -t g6.xlarge -n 1 2>&1); rc=$?
+[[ $rc -eq 1 && "$out" == *"Refusing to create real reservations"* && ! -s "$FAKE_DIR/db" ]] && ok "real run without --i-understand-this-is-a-demo refuses" || { bad "demo guard (rc=$rc)"; echo "$out"; }
+
 # type not offered anywhere -> exit 2
 cat > "$tmp/bin/aws2" <<'F'
 #!/usr/bin/env bash
 case "$*" in *offerings*) echo "";; *) exit 1;; esac
 F
 mkdir -p "$tmp/bin2"; mv "$tmp/bin/aws2" "$tmp/bin2/aws"; chmod +x "$tmp/bin2/aws"
-out=$(cd "$tmp" && PATH="$tmp/bin2:$PATH" timeout 20 "$H" -r zz-test-1 -t p9.huge -n 1 2>&1); rc=$?
+out=$(cd "$tmp" && PATH="$tmp/bin2:$PATH" timeout 20 "$H" -r zz-test-1 --i-understand-this-is-a-demo -t p9.huge -n 1 2>&1); rc=$?
 [[ $rc -eq 2 ]] && ok "no usable type/AZ exits 2" || { bad "not offered (rc=$rc)"; echo "$out"; }
 
 for a in "-n 0" "-i 0" "-n abc" "-t"; do
-  out=$(cd "$tmp" && PATH="$tmp/bin:$PATH" timeout 10 "$H" -r zz-test-1 $( [[ "$a" == "-t" ]] || echo -t g6.xlarge ) $a 2>&1); rc=$?
+  out=$(cd "$tmp" && PATH="$tmp/bin:$PATH" timeout 10 "$H" -r zz-test-1 --i-understand-this-is-a-demo $( [[ "$a" == "-t" ]] || echo -t g6.xlarge ) $a 2>&1); rc=$?
   [[ $rc -eq 1 ]] && ok "rejects '$a'" || { bad "rejects '$a' (rc=$rc)"; echo "$out"; }
 done
 
-out=$("$H" -h); [[ "$out" != *"set -uo"* && "$out" == *"Usage:"* && "$out" == *"--release"* ]] && ok "--help shows the whole header and no code" || { bad "--help"; echo "$out"; }
+out=$("$H" -h); [[ "$out" != *"set -uo"* && "$out" == *"SAMPLE CODE"* && "$out" == *"--release"* ]] && ok "--help shows the whole header and no code" || { bad "--help"; echo "$out"; }
 
 printf 'time_utc,elapsed_s,round,type,az,count,result,api_ms\n2026-01-01T00:00:00Z,0,1,g6.xlarge,a,1,no-capacity,1300\n2026-01-01T00:00:41Z,41,2,g6.xlarge,b,2,won-active,1500\n' > "$tmp/ev.csv"
 out=$("$here/tools/report.sh" "$tmp/ev.csv"); [[ "$out" == *"attempts=2 rounds=2"*"first_win=41s"*"instances_won=2"* && "$out" == *"no-capacity=1"* ]] && ok "report.sh summarises an events file" || { bad "report.sh"; echo "$out"; }

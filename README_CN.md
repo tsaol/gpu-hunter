@@ -1,99 +1,194 @@
 # gpu-hunter
 
-> [!WARNING]
-> **只用于演示和学习，不要用在生产环境。**
-> 这是示例代码，不是 AWS 官方工具。没有经过生产规模的测试，也没有生产级别的
-> 错误处理、监控和审计，不提供任何保证（见 [LICENSE](LICENSE)）。
-> 容量预留**从创建那一刻起就开始收费**，用不用都收。脚本建出来的预留由你负责，
-> 也由你负责释放。运行前请先读一遍代码。
+**一个示例：GPU 很难开出来的时候，怎么用 EC2 按需容量预留（ODCR）的 API。**
 
-一个 bash 脚本：在多个机型、多个 AZ 之间不断申请 **ODCR（按需容量预留）**，
-直到抢满目标台数，或者你让它停下来。它**不保证一定能抢到**，只是把 AWS 官方文档里
-建议的做法自动化：过一会儿再试、换 AZ、少要一点、换机型。
+> [!IMPORTANT]
+> **这个仓库是用来学习 API 的，不是拿来直接运行的工具，也不能用在生产环境。**
+> 脚本是一个讲解用的例子：读它，看这些 API 是怎么配合使用的，然后按自己的需要写自己的代码。
+> 它不是 AWS 官方工具，不提供任何保证（见 [LICENSE](LICENSE)）。
+> 容量预留**从创建那一刻起就收费**，用不用都收。
+> 不加 `--i-understand-this-is-a-demo` 参数，脚本不会真的创建预留。
 
-[English](README.md) · [机制详解](docs/MECHANISM.md)
+[English](README.md) · [机制详解（带流程图）](docs/MECHANISM.md)
 
-## 为什么用 ODCR，不直接 run-instances
+---
 
-| | run-instances | ODCR（立即生效） |
-|---|---|---|
-| 拿到的是什么 | 一台运行中的机器 | 某个 AZ 里，某个机型 + 平台 + 租户类型的容量 |
-| 每次都要 AMI / 子网 / 安全组 | 要 | 不要 |
-| 机器 stop / terminate 以后 | 容量还回去 | 预留一直在，直到你取消 |
-| 只抢到一部分 | 用 `MinCount` 可以少拿 | 一次请求就是一个预留，数量就是请求的数量 |
-| 价格 | 按需价，机器运行时才收 | 按需价，**预留存在就收，用不用都收**（按秒计，最少 60 秒） |
-| Savings Plans / 区域型 RI 折扣 | 有效 | 有效（可用区型 RI 无效） |
+## 读完能学到什么
 
-来源：[EC2 Capacity Reservations](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-reservations.html)、
-[计费](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-pricing-billing.html)。
+1. 开 GPU 为什么会报 `InsufficientInstanceCapacity`，能怎么办。
+2. 按需容量预留（ODCR）是怎么回事，为什么比反复 `run-instances` 好。
+3. 需要的 **4 个 API**：怎么调用，每个有什么坑。
+4. 示例脚本是怎么把它们串起来的：重试、减半、换 AZ / 机型、退避。
+5. 什么时候应该用官方的 **Capacity Reservation Fleet**。
 
-### 先考虑官方的方案
+## 一张图看懂
+
+ODCR 就像订酒店房间：订到了，房间就一直给你留着，没人住也留着；从订到那一刻起就开始收钱。
+
+```mermaid
+flowchart LR
+    A["订房<br/>CreateCapacityReservation"] --> B["房间留着<br/>按按需价收钱"]
+    B --> C["入住<br/>在预留里开机器"]
+    C --> D["退房<br/>机器关掉<br/>容量还是你的"]
+    D -- "想用再开" --> C
+    D --> E["退订<br/>CancelCapacityReservation<br/>停止收钱"]
+```
+
+和 `run-instances` 比，最关键的区别是 D 这一步：**机器关了，容量还在。**
+
+## 先考虑官方方案
 
 [Capacity Reservation Fleet](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/cr-fleets.html)
 由 AWS 托管：容量不够时会在后台一直重试，直到满足目标；预留被取消了还会自动补回来。
-但它**只能在一个 AZ 里**，**只支持 open 模式**。
-需要多个 AZ 一起抢、需要 targeted 模式、或者想要每次尝试的记录时，再用这个脚本。
-详见 [docs/MECHANISM.md 第 4 节](docs/MECHANISM.md)。
+但它**只能在一个 AZ 里**（多个 AZ 时 API 会直接报错），**只支持 open 模式**。
+这个仓库讲的是更底层的 API 调用，适合要多个 AZ、要 targeted 模式、或者要自己记录每次尝试的情况。
 
-## 脚本做了什么
+---
 
-1. 查每个机型在哪些 AZ 有，没有的跳过。
-2. 检查有没有读取预留的权限，没有就停。
-3. 每一轮，按你给的机型顺序、在每个 AZ 里申请剩下的全部数量；碰到 `InsufficientInstanceCapacity` 就减半（4 → 2 → 1，除了最后几台，不会低于 `--min-chunk`）。
-4. 返回 `active` 或 `pending` 都算抢到。因为最终一致性，`pending` 最多可能持续约 5 分钟，脚本不会取消它。返回 `failed` 不算。pending 的预留之后会再查：如果变成 `failed`，就把数量加回去继续抢。宣布"抢满"之前，最多等 6 分钟让 pending 的结果出来。
-5. 用 `AWS_MAX_ATTEMPTS=1` 调 CLI（不让 CLI 偷偷重试），每个请求都带一个唯一的 `ClientToken`。碰到网络错误、5xx 这类"不知道成没成功"的情况，就把**同一个**请求最多再发 2 次，所以响应丢了也不会多建一个预留。如果还是不清楚，这一轮就不再发新请求。
-6. 每轮开始前去 AWS 查这次运行（tag `gpu-hunter-run`）已经拿到了多少台。因为查询是最终一致的，这个数字只用来**调低**剩余数量，不会调高。
-7. 轮与轮之间：每次一无所获就把等待时间乘 1.5，从 `--interval`（30 秒）到 `--max-interval`（300 秒），加随机抖动；碰到限流就马上停止这一轮，等最长时间再来。
-8. 碰到配额、权限、参数错误马上停。
-9. 每次尝试都在 CSV 里记一行，结束时打印一行统计。
+## 4 个 API
 
-## 前提
-
-- bash 4+、AWS CLI v2、目标账号和区域的凭证。
-- 这个机型系列的按需 vCPU 配额（预留也算在里面）。
-- IAM 权限：`ec2:CreateCapacityReservation`、`ec2:DescribeCapacityReservations`、`ec2:CancelCapacityReservation`、`ec2:DescribeInstanceTypeOfferings`、`ec2:CreateTags`；用 `-s` 的话还要 `sns:Publish`。
-
-## 怎么用
+### 1. 这个机型在哪些 AZ 有？—— `DescribeInstanceTypeOfferings`
 
 ```bash
-# 1. 一定先 dry-run：只检查权限和参数，不创建任何东西
-./gpu-hunter.sh -r eu-central-1 -t g6e.12xlarge -n 2 --dry-run
-
-# 2. 抢 4 台：先试 g6e.12xlarge，再试 g6e.24xlarge；6 小时还没抢满就停
-./gpu-hunter.sh -r eu-central-1 -t g6e.12xlarge,g6e.24xlarge -n 4 --max-hours 6
-
-# 3. 看这个工具建了哪些预留，不用了就释放（停止收费）
-./gpu-hunter.sh -r eu-central-1 --status
-./gpu-hunter.sh -r eu-central-1 --release
-
-# 4. 汇总一次运行的结果（默认用当前目录里最新的事件文件）
-tools/report.sh
+aws ec2 describe-instance-type-offerings --region eu-central-1 \
+  --location-type availability-zone \
+  --filters Name=instance-type,Values=g6e.12xlarge \
+  --query 'InstanceTypeOfferings[].Location' --output text
 ```
 
-参数、退出码和环境变量见 [README.md](README.md)。
+- 没有这个机型的 AZ 直接跳过，去那里申请永远不会成功。
+- AZ 名字（`eu-central-1a`）在每个账号里对应的物理机房不一样，跨账号要用 AZ ID。
 
-## 运行前要知道
-
-- **open 模式会吃掉正在跑的实例**：账号里已经有同机型、同平台、同 AZ 的实例的话，预留一生效它们就会占进来。不想这样就用 `--targeted`。
-- **API 限流是共用的**：`CreateCapacityReservation` 属于 mutating 操作，EC2 按账号 + 区域给所有 mutating 操作共用一个令牌桶（写这篇时是 50 个令牌，每秒补 5 个）。间隔太短会影响客户自己的自动化。见 [EC2 API throttling](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html)。
-- **每次没抢到都会留下一条 `failed` 记录**：不收费，不占配额，60 分钟后就看不到了。
-- **尽量在同一个区域里运行**（比如 CloudShell，或者在那个区域开一台小机器）：我们实测，查询请求在本区域约 0.4 秒、跨区域约 1.3 秒；创建请求只测过跨区域，约 1.3–1.5 秒。
-- 同一个 AZ 名字在不同账号里对应的物理 AZ 不一样，跨账号要用 AZ ID。
-- 脚本退出以后，就不会再管这些预留了。
-
-## 怎么判断效果
-
-见 [docs/MECHANISM.md 第 7 节](docs/MECHANISM.md)：第一次抢到用时、抢满用时、完成率、每次成功要请求几次、各个机型 × AZ 的成功率、被限流次数、闲置成本（CloudWatch `InstanceUtilization`）。要和基线对比，两种配置轮流跑，**不要在同一个账号里同时跑两种配置**。
-
-## 测试
+### 2. 订容量 —— `CreateCapacityReservation`
 
 ```bash
-tests/test.sh          # 离线测试：用有状态的假 aws 命令模拟没容量、failed / pending 状态、
-                       # 响应丢失、配额、没权限、参数错误
-LIVE=1 tests/test.sh   # 再加一次真实的 --dry-run（需要凭证，不创建任何东西）
+aws ec2 create-capacity-reservation --region eu-central-1 \
+  --instance-type g6e.12xlarge \
+  --instance-platform Linux/UNIX \
+  --availability-zone eu-central-1a \
+  --instance-count 4 \
+  --instance-match-criteria targeted \
+  --end-date-type unlimited \
+  --client-token "my-unique-id-0001" \
+  --tag-specifications 'ResourceType=capacity-reservation,Tags=[{Key=purpose,Value=gpu-test}]' \
+  --query 'CapacityReservation.[CapacityReservationId,State]' --output text
 ```
 
-哪些验证过、哪些没验证过，见 [docs/MECHANISM.md 第 7.4 节](docs/MECHANISM.md)。
+要知道的事：
+
+| 主题 | 会发生什么 | 怎么做 |
+|---|---|---|
+| **要么全给，要么不给** | 一次调用只建一个预留，数量就是 `--instance-count`（1–1000），不会只给一部分 | 碰到 `InsufficientInstanceCapacity`，就少要一点再试（4 → 2 → 1） |
+| **没订到也会留下记录** | 每次没货，都会留下一条 `failed` 状态的预留。不收钱、不占配额，60 分钟后消失 | 控制台里会看到，正常 |
+| **CLI 会偷偷重试** | CLI/SDK 默认最多发 3 次；我们实测一次没货的调用留下了 3 条 `failed` 记录 | 设 `AWS_MAX_ATTEMPTS=1`，自己控制重试 |
+| **回复丢了** | 网络超时的话，你不知道预留到底建没建 | 带上 `--client-token`。用**同一个** token 重发，AWS 会返回第一次的结果，不会再建一个（已实测） |
+| **配额** | 预留占的是按需 vCPU 配额 | 配额错误重试多少次都没用，要申请提高配额 |
+| **open 和 targeted** | open（默认）：对得上的机器都会用上它，**包括已经在跑的机器**；targeted：只有写明了它的机器才能用 | 账号里已经有同型号的机器在跑的话，用 targeted |
+| **平台** | 要和 AMI 的 `PlatformDetails` 一样（`Linux/UNIX` 和 `Red Hat Enterprise Linux` 不是一回事） | 先查 AMI |
+| **限流** | 这是"修改资源"类 API。EC2 按账号 + 区域给所有修改类 API **共用一个令牌桶**（写这篇时是 50 个，每秒补 5 个） | 慢慢重试，用退避 + 随机抖动。重试太快会连累客户自己的自动化程序 |
+
+### 3. 查状态 —— `DescribeCapacityReservations`
+
+```bash
+aws ec2 describe-capacity-reservations --region eu-central-1 \
+  --filters Name=tag:purpose,Values=gpu-test Name=state,Values=active,pending \
+  --query 'CapacityReservations[].[CapacityReservationId,InstanceType,AvailabilityZone,TotalInstanceCount,AvailableInstanceCount,State]' \
+  --output text
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: 订到了
+    [*] --> active: 订到了
+    [*] --> failed: 没货 / 超配额 / 参数错
+    pending --> active: 最多约 5 分钟
+    active --> cancelled: 你退订
+    active --> expired: 到了结束时间
+```
+
+- **`pending` 不是失败。** 因为 API 是最终一致的，状态最多可能要约 5 分钟才显示 `active`。不要退掉它。
+- `pending` 的预留暂时不能退订。
+- 查询结果可能比创建慢一步：查不到，不等于没建成。
+
+### 4. 释放 —— `CancelCapacityReservation`
+
+```bash
+aws ec2 cancel-capacity-reservation --region eu-central-1 \
+  --capacity-reservation-id cr-0123456789abcdef0
+```
+
+- 从预留存在那一刻起**按秒收费，最少 60 秒**。立即生效的预留随时可以退，退订免费。
+- 退订以后，正在跑的机器会继续跑，按普通按需价收费。
+
+### 怎么用上订到的容量
+
+targeted 模式下，开机时写明用哪个预留：
+
+```bash
+aws ec2 run-instances ... \
+  --capacity-reservation-specification 'CapacityReservationTarget={CapacityReservationId=cr-0123456789abcdef0}'
+```
+
+---
+
+## 示例脚本是怎么把这些 API 串起来的
+
+[`gpu-hunter.sh`](gpu-hunter.sh)（bash + AWS CLI v2）就是把上面这些调用放进一个重试循环里的例子。
+
+```mermaid
+flowchart TD
+    S(["开始"]) --> P["DescribeInstanceTypeOfferings<br/>只留下有这个机型的 AZ"]
+    P --> R["一轮：每个机型 × 每个 AZ<br/>CreateCapacityReservation，申请还差的数量"]
+    R --> Q{"结果？"}
+    Q -- "订到了" --> W["记下来，继续申请还差的<br/>pending 的之后再确认"]
+    Q -- "没货" --> H["数量减半再试<br/>还不行就换下一个 AZ / 机型<br/>全部试完，这一轮才结束"]
+    Q -- "不清楚（超时）" --> T["用同一个 ClientToken 重发（最多 2 次）<br/>然后结束这一轮"]
+    Q -- "被限流" --> E["结束这一轮，等最长时间"]
+    Q -- "配额 / 权限错误" --> X(["停止"])
+    W --> F{"订满了吗？"}
+    H --> F
+    T --> F
+    E --> F
+    F -- "没有" --> Z["等 30 秒 → 每轮 ×1.5 → 最多 300 秒，加随机时间"] --> R
+    F -- "订满了" --> D(["确认 pending 的都变成 active，完成"])
+```
+
+示例里演示了几个容易写错的地方：
+
+- `pending` 算订到，但宣布完成之前会再确认一次。
+- 结果不清楚的时候，这一轮**不再发新请求**（新 token 可能会重复订）。
+- 每轮都会按 tag（`gpu-hunter-run`）重新查这次运行已经订到了多少，而且只用来**往下调**剩余数量，因为查询结果可能有延迟。
+- 每次尝试都在 CSV 里记一行，方便衡量效果（`tools/report.sh`）。
+
+完整的讲解见 [docs/MECHANISM.md](docs/MECHANISM.md)：每条事实都有出处，也讲了怎么评估效果。
+
+## 如果还是想试一下示例
+
+只在**测试账号**里试，而且先读一遍代码。
+
+```bash
+# 只看 API 调用，不创建任何东西
+./gpu-hunter.sh -r eu-central-1 -t g6.xlarge -n 2 --dry-run
+
+# 真的运行：会创建要收费的预留，所以必须加上这个参数
+./gpu-hunter.sh -r eu-central-1 -t g6.xlarge -n 2 --max-hours 1 --i-understand-this-is-a-demo
+
+./gpu-hunter.sh -r eu-central-1 --status     # 看订到了什么
+./gpu-hunter.sh -r eu-central-1 --release    # 全部释放（停止收费）
+tools/report.sh                              # 汇总最近一次运行
+```
+
+全部参数、退出码和需要的 IAM 权限，见 [README.md](README.md) 里的 "All options, exit codes, permissions"。
+
+## 仓库里有什么
+
+| 路径 | 是什么 |
+|---|---|
+| `gpu-hunter.sh` | 示例：把 4 个 API 放进重试循环 |
+| `docs/MECHANISM.md` | ODCR、限流、重试、ClientToken 是怎么回事；流程图；怎么评估效果 |
+| `tools/report.sh` | 汇总一次运行的逐次记录（CSV） |
+| `tests/test.sh` | 离线测试，用假的 `aws` 命令（`LIVE=1` 会加一次真实的 `--dry-run`），大约 30 秒 |
 
 ## License
 

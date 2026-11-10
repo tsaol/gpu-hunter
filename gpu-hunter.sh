@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# gpu-hunter.sh - keep trying to reserve On-Demand GPU capacity (ODCR) until the target is met.
+# gpu-hunter.sh - SAMPLE CODE. It shows how the EC2 On-Demand Capacity Reservation
+# (ODCR) APIs fit together when you keep trying for scarce GPU capacity.
 #
-# How it works:
+# It is meant to be READ, to explain the APIs. It is not a tool to run as-is and
+# not for production. Real runs create reservations that are billed at On-Demand
+# price from the moment they exist, so they need --i-understand-this-is-a-demo.
+#
+# APIs it shows (see README.md and docs/MECHANISM.md):
+#   DescribeInstanceTypeOfferings  which AZs offer a type
+#   CreateCapacityReservation      reserve capacity (ClientToken, tags, open/targeted)
+#   DescribeCapacityReservations   read state: pending / active / failed
+#   CancelCapacityReservation      release, billing stops
+#
+# What the sample does:
 #   - Tries each instance type (in your order) in each AZ where it is offered.
-#   - Asks for all remaining instances; if AWS says InsufficientInstanceCapacity,
-#     it halves the count and tries again (down to MIN_CHUNK).
-#   - Every reservation it gets is kept and tagged (gpu-hunter=<tag>, gpu-hunter-run=<run id>).
-#     Each round re-reads from AWS how much this run holds, so a lost response can't over-reserve.
-#   - Waits longer after each failed round (backoff + jitter), resets after a win.
+#   - On InsufficientInstanceCapacity it halves the count and tries again (down to MIN_CHUNK).
+#   - Tags every reservation (gpu-hunter=<tag>, gpu-hunter-run=<run id>).
+#   - Waits longer after each empty round (backoff + jitter); stops a round on throttling.
 #   - Stops at once on quota / permission / parameter errors (retrying won't help).
 #
-# Usage:
-#   ./gpu-hunter.sh -t g6e.12xlarge,g6e.24xlarge -n 4            # reserve 4 instances
-#   ./gpu-hunter.sh -t p4d.24xlarge -n 2 -z eu-central-1a,eu-central-1b -s arn:aws:sns:...
-#   ./gpu-hunter.sh -t g6.xlarge -n 2 --dry-run                   # test, creates nothing
-#   ./gpu-hunter.sh --status                                      # list what we hold
-#   ./gpu-hunter.sh --release                                     # cancel all our reservations
-#
-# Billing: an ODCR is billed at On-Demand price from the moment it is active,
-# even if no instance runs in it. Cancel with --release when you no longer need it.
+# Usage (in a test account):
+#   ./gpu-hunter.sh -t g6.xlarge -n 2 --dry-run                   # checks only, creates nothing
+#   ./gpu-hunter.sh -t g6.xlarge -n 2 --i-understand-this-is-a-demo   # real run, costs money
+#   ./gpu-hunter.sh --status                                      # list what it holds
+#   ./gpu-hunter.sh --release                                     # cancel all its reservations
 
 set -uo pipefail
 
@@ -35,6 +40,7 @@ MAX_HOURS=0             # 0 = run forever
 SNS_TOPIC=""
 TAG="gpu-hunter"
 DRY_RUN=0
+ACK=0
 MODE="hunt"
 LOG="${GPU_HUNTER_LOG:-./gpu-hunter.log}"
 EVENTS="${GPU_HUNTER_EVENTS:-}"   # one line per API attempt; default: one file per run (see RUN_ID)
@@ -61,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --platform) PLATFORM="$2"; shift 2;;
     --tag) TAG="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
+    --i-understand-this-is-a-demo) ACK=1; shift;;
     --status) MODE="status"; shift;;
     --release) MODE="release"; shift;;
     -h|--help) usage 0;;
@@ -112,6 +119,18 @@ if [[ "$MODE" == "release" ]]; then
 fi
 
 [[ -z "$TYPES" ]] && { echo "need -t <types>"; usage 1; }
+cat >&2 <<'NOTE'
+------------------------------------------------------------------------
+ gpu-hunter is SAMPLE CODE that explains the Capacity Reservation APIs.
+ It is not a tool to run as-is and not for production. Read the code.
+ Real reservations are billed at On-Demand price while they exist.
+------------------------------------------------------------------------
+NOTE
+if (( DRY_RUN == 0 && ACK == 0 )); then
+  echo "Refusing to create real reservations: this is a demo. Use --dry-run to see the API" >&2
+  echo "calls, or add --i-understand-this-is-a-demo in a test account if you really want to." >&2
+  exit 1
+fi
 for v in TARGET:1 MIN_CHUNK:1 INTERVAL:1 MAX_INTERVAL:1 MAX_HOURS:0; do
   name=${v%%:*}; min=${v##*:}; val=${!name}
   [[ "$val" =~ ^[0-9]+$ ]] || { echo "$name must be a whole number >= $min (got '$val')"; exit 1; }
