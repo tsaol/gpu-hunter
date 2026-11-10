@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Block the commit if staged changes contain secrets or sensitive info.
+#   1) built-in gitleaks rules (real keys / tokens)
+#   2) .gitleaks-rules.toml in this repo: generic sensitive patterns
+#   3) ~/.config/gitleaks/private.toml (outside any repo): private names
+# Enable once per clone:  git config core.hooksPath .githooks
+set -uo pipefail
+root=$(git rev-parse --show-toplevel)
+GL=$(command -v gitleaks || true)
+[ -z "$GL" ] && [ -x "$HOME/.local/bin/gitleaks" ] && GL="$HOME/.local/bin/gitleaks"
+if [ -z "$GL" ]; then
+  echo "pre-commit: gitleaks not found, commit blocked. Install it from https://github.com/gitleaks/gitleaks/releases or put it in ~/.local/bin." >&2
+  exit 1
+fi
+fail=0
+# author / committer must not leak a machine name or work email
+for who in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+  id=$(git var $who 2>/dev/null | sed -E 's/ [0-9]+ [+-][0-9]{4}$//')
+  if echo "$id" | grep -qiE '\.compute\.internal|@amazon\.com|ec2-user@|ubuntu@ip-|root@ip-'; then
+    echo "pre-commit: $who is '$id' (machine name or work email). Set: git config user.name tsaol; git config user.email tsaol@users.noreply.github.com" >&2
+    fail=1
+  fi
+done
+"$GL" git "$root" --pre-commit --staged --redact --no-banner -v || fail=1
+"$GL" git "$root" --pre-commit --staged --config "$root/.gitleaks-rules.toml" --redact --no-banner -v || fail=1
+PRIV="$HOME/.config/gitleaks/private.toml"
+if [ -f "$PRIV" ]; then
+  "$GL" git "$root" --pre-commit --staged --config "$PRIV" --redact --no-banner -v || fail=1
+else
+  echo "pre-commit: warning: $PRIV not found, private-name rules skipped on this machine." >&2
+fi
+if [ $fail -ne 0 ]; then
+  echo >&2; echo "pre-commit: sensitive content found in staged changes (see above). Commit blocked." >&2
+  exit 1
+fi
