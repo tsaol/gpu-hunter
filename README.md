@@ -1,101 +1,149 @@
-# grab-gpu
+# gpu-hunter
 
-Keep trying to reserve **On-Demand GPU capacity** on AWS until you get it.
+> [!WARNING]
+> **For demonstration and learning only. Do not use in production.**
+> This is sample code, not an official AWS tool. It has not been tested at
+> production scale, has no production-grade error handling, monitoring or audit,
+> and comes with no warranty (see [LICENSE](LICENSE)). Capacity Reservations
+> **cost money from the moment they exist**, used or not. You are responsible for
+> any reservations it creates and for releasing them. Read the code before you run it.
 
-When a GPU type is hard to get, `run-instances` fails with
-`InsufficientInstanceCapacity`. `grab-gpu.sh` keeps asking for an
-**On-Demand Capacity Reservation (ODCR)** across instance types and AZs, and
-keeps every reservation it wins. Once you hold the reservation, you can start,
-stop and replace instances in it without losing the capacity.
+A bash script that keeps requesting an **On-Demand Capacity Reservation (ODCR)**
+for GPU instance types across Availability Zones, until it reaches a target
+instance count or you stop it. It does not guarantee capacity: it only automates
+the retry advice from the AWS documentation (retry later, try another AZ, request
+fewer instances, try another instance type).
 
-[中文说明](README_CN.md)
+[中文说明](README_CN.md) · [How the mechanism works (中文)](docs/MECHANISM.md)
 
-## Why ODCR and not run-instances?
+## Why ODCR and not run-instances
 
-| | run-instances | ODCR |
+| | run-instances | ODCR (immediate) |
 |---|---|---|
-| What you get | a running instance | capacity for a type in one AZ, held for you |
-| Needs AMI / subnet / SG / key | yes, on every try | no, only type + AZ + count |
-| After stop / terminate | capacity goes back to the pool | capacity stays yours |
-| Partial result | MinCount lets you take fewer | all or nothing per request (the script halves and retries) |
-| Price | On-Demand, while running | On-Demand, **from the moment it is active, used or not** |
-| Savings Plans | yes | yes |
+| What you get | a running instance | capacity for one instance type + platform + tenancy in one AZ |
+| Needs AMI / subnet / security group | yes, on every try | no |
+| After the instance is stopped / terminated | capacity goes back | the reservation stays until you cancel it |
+| Partial result | `MinCount` lets you take fewer | one request = one reservation of exactly the requested count |
+| Price | On-Demand, while the instance runs | On-Demand, **while the reservation exists, used or not** (per second, 60 s minimum) |
+| Savings Plans / Regional RI discounts | apply | apply (zonal RI discounts do not) |
+
+Source: [EC2 Capacity Reservations](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-reservations.html),
+[pricing and billing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-pricing-billing.html).
+
+### Consider the native option first
+
+[Capacity Reservation Fleets](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/cr-fleets.html)
+are managed by AWS: if capacity is short, the fleet keeps trying in the
+background until it reaches the target, and it replaces reservations that get
+cancelled. A fleet works in **one AZ only** and supports **`open` matching only**.
+Use this script when you need several AZs in one run, `targeted` matching, or a
+per-attempt log. See [docs/MECHANISM.md §4](docs/MECHANISM.md).
 
 ## What the script does
 
-- Tries each instance type (in your order) in each AZ where AWS offers it.
-- Asks for all remaining instances; on `InsufficientInstanceCapacity` it halves
-  the count (4 → 2 → 1) so you keep whatever is free.
-- Tags every reservation (`grab-gpu=<tag>`), so `--status` and `--release` can find them.
-- Waits longer after each empty round (30 s → max 300 s, with jitter), and resets after a win.
-- Stops at once on quota, permission or parameter errors (retrying won't help).
-- Optional SNS message on every win and at the end.
+1. Lists which AZs offer each instance type (`describe-instance-type-offerings`)
+   and skips the rest.
+2. Checks that it can read Capacity Reservations; stops if not.
+3. Each round, for each type (your order) and each AZ, requests all remaining
+   instances. On `InsufficientInstanceCapacity` it halves the count (4 → 2 → 1,
+   never below `--min-chunk` except for the last few).
+4. A reservation returned as `active` or `pending` counts as won (state can stay
+   `pending` for up to ~5 minutes due to eventual consistency; the script never
+   cancels it). One returned as `failed` does not count.
+5. Calls the CLI with `AWS_MAX_ATTEMPTS=1` (no hidden retries) and a unique
+   `ClientToken` per request. On an unclear result (network error, 5xx) it
+   re-sends the **same** request, so a lost response can't create a second reservation.
+6. Each round it re-reads from AWS how many instances this run holds
+   (tag `gpu-hunter-run`). It only ever lowers the remaining count from that
+   number, never raises it, because describe calls are eventually consistent.
+7. Between rounds: wait ×1.5 per empty round, from `--interval` (30 s) up to
+   `--max-interval` (300 s), plus jitter; on API throttling it waits the maximum.
+8. Stops at once on quota, permission or parameter errors.
+9. Writes one CSV line per attempt and a summary line at exit.
 
-## Quick start
+## Requirements
 
-Needs bash 4+ and AWS CLI v2. No Python.
+- bash 4+, AWS CLI v2, credentials for the target account and Region.
+- On-Demand vCPU quota for the instance family (reservations count against it).
+- IAM: `ec2:CreateCapacityReservation`, `ec2:DescribeCapacityReservations`,
+  `ec2:CancelCapacityReservation`, `ec2:DescribeInstanceTypeOfferings`,
+  `ec2:CreateTags`; `sns:Publish` if you use `-s`.
+
+## Usage
 
 ```bash
-# test first: --dry-run checks permissions and parameters, creates nothing
-./grab-gpu.sh -r eu-central-1 -t g6e.12xlarge -n 2 --dry-run
+# 1. always start with a dry run: checks permissions and parameters, creates nothing
+./gpu-hunter.sh -r eu-central-1 -t g6e.12xlarge -n 2 --dry-run
 
-# grab 4 instances, g6e.12xlarge first, then g6e.24xlarge, SNS on success
-./grab-gpu.sh -r eu-central-1 -t g6e.12xlarge,g6e.24xlarge -n 4 \
-  -s arn:aws:sns:<region>:<account>:<topic>
+# 2. reserve 4 instances: g6e.12xlarge first, then g6e.24xlarge; give up after 6 hours
+./gpu-hunter.sh -r eu-central-1 -t g6e.12xlarge,g6e.24xlarge -n 4 --max-hours 6
 
-# keep it running after you log out
-nohup ./grab-gpu.sh -r eu-central-1 -t p4d.24xlarge -n 2 > grab.out 2>&1 &
+# 3. see what this tool holds, and release it (billing stops)
+./gpu-hunter.sh -r eu-central-1 --status
+./gpu-hunter.sh -r eu-central-1 --release
 
-./grab-gpu.sh -r eu-central-1 --status    # what we hold
-./grab-gpu.sh -r eu-central-1 --release   # cancel them all, billing stops
+# 4. summarise a run
+tools/report.sh gpu-hunter-events-<run id>.csv
 ```
 
 | Option | Meaning | Default |
 |---|---|---|
 | `-t, --types` | instance types, comma separated, in priority order | required |
-| `-n, --count` | how many instances in total | 1 |
-| `-r, --region` | region | `$GRAB_REGION` or eu-central-1 |
-| `-z, --azs` | only these AZs | all AZs that offer the type |
-| `-m, --min-chunk` | smallest reservation to accept | 1 |
-| `-i, --interval` / `--max-interval` | wait between rounds (s) | 30 / 300 |
-| `--max-hours` | give up after N hours (exit 4) | 0 = never |
+| `-n, --count` | total instances wanted | 1 |
+| `-r, --region` | Region | `$GPU_HUNTER_REGION`, else eu-central-1 |
+| `-z, --azs` | only these AZs (names, as seen in your account) | every AZ that offers the type |
+| `-m, --min-chunk` | smallest reservation to request | 1 |
+| `-i, --interval` / `--max-interval` | wait between rounds, seconds | 30 / 300 |
+| `--max-hours` | stop after N hours (exit 4) | 0 = no limit |
 | `-s, --sns` | SNS topic ARN for messages | none |
-| `--targeted` | only instances that name the reservation can use it | open |
-| `--tag` | tag value, to run several jobs side by side | grab-gpu |
+| `--targeted` | only instances that name the reservation can use it | `open` |
+| `--platform` | must match the AMI's `PlatformDetails` | `Linux/UNIX` |
+| `--tag` | value of the `gpu-hunter` tag, to keep jobs apart | `gpu-hunter` |
 | `--dry-run` | check only | off |
 
-Exit codes: `0` done, `2` no usable type/AZ, `3` fatal error (quota, permission), `4` time limit.
+Exit codes: `0` target reached · `1` bad input · `2` no usable type/AZ ·
+`3` fatal (quota, permission, parameters) · `4` time limit · `130` stopped by signal.
+Reservations already won are **kept** on every exit; release them with `--release`.
 
-## Using the capacity
+Environment: `GPU_HUNTER_REGION`, `GPU_HUNTER_LOG` (default `./gpu-hunter.log`),
+`GPU_HUNTER_EVENTS` (default `./gpu-hunter-events-<run id>.csv`, one file per run).
 
-With the default `open` match, any instance in the same account with the same
-type, platform and AZ uses the reservation automatically. With `--targeted`, pass
-`--capacity-reservation-specification CapacityReservationTarget={CapacityReservationId=cr-...}`
-to `run-instances`.
+## Things to know before you run it
 
-## Before you start
+- **`open` matching takes running instances.** If the account already runs
+  instances of the same type, platform and AZ, they move into the new reservation
+  as soon as it is active. Use `--targeted` to avoid this, then launch with
+  `--capacity-reservation-specification CapacityReservationTarget={CapacityReservationId=cr-...}`.
+- **The API rate limit is shared.** `CreateCapacityReservation` is a mutating
+  action; EC2 throttles mutating actions per account and Region with one shared
+  bucket (50 tokens, refill 5/s at the time of writing). Very short intervals can
+  throttle the customer's own automation. See
+  [EC2 API throttling](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html).
+- **Every no-capacity attempt leaves a `failed` reservation record.** It costs
+  nothing, does not count against quota, and disappears from view after 60 minutes.
+- **Run it in the same Region** if you can (for example CloudShell or a small
+  instance there): in our test, a call took ~0.4 s in-Region and ~1.3 s cross-Region.
+- AZ names map to different physical AZs in each account. Across accounts, use AZ IDs.
+- The script does not watch reservations after it exits.
 
-1. **Check the On-Demand vCPU quota** (`Running On-Demand G and VT instances`,
-   `Running On-Demand P instances`). Often the real problem is the quota, not capacity.
-   One p4d.24xlarge is 96 vCPUs.
-2. **Give more types and AZs** if the workload allows it. More choices, more chances.
-3. **Release what you don't use.** An active ODCR is billed even with no instance in it.
-4. For large or long-term needs, also talk to your AWS account team. The script
-   only catches capacity that frees up.
+## How to judge whether it works
 
-## IAM permissions
-
-`ec2:CreateCapacityReservation`, `ec2:DescribeCapacityReservations`,
-`ec2:CancelCapacityReservation`, `ec2:DescribeInstanceTypeOfferings`,
-`ec2:CreateTags`, and `sns:Publish` if you use `-s`.
+See [docs/MECHANISM.md §7](docs/MECHANISM.md): time to first / full
+reservation, fill rate, attempts per win, win rate per type × AZ, throttle
+count, and idle cost (CloudWatch `InstanceUtilization`). Compare against a
+baseline in alternating time windows, never two configurations at the same time
+in the same account.
 
 ## Tests
 
 ```bash
-tests/test.sh            # offline, a fake aws CLI simulates capacity and quota errors
-LIVE=1 tests/test.sh     # also a real --dry-run call (needs credentials, creates nothing)
+tests/test.sh          # offline: a stateful fake aws CLI simulates no-capacity,
+                       # failed / pending states, lost responses, quota, permission, bad input
+LIVE=1 tests/test.sh   # also one real --dry-run call (needs credentials, creates nothing)
 ```
+
+What has and has not been verified is listed in [docs/MECHANISM.md §7.4](docs/MECHANISM.md).
 
 ## License
 
-MIT-0. See [LICENSE](LICENSE).
+MIT-0. See [LICENSE](LICENSE). Provided "as is", without warranty of any kind.
