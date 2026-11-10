@@ -14,6 +14,7 @@ cat > "$tmp/bin/aws" <<'F'
 st="$FAKE_STATE"; n=$(cat "$st" 2>/dev/null || echo 0)
 case "$*" in
  *describe-instance-type-offerings*) echo "zz-test-1a zz-test-1b";;
+ *describe-capacity-reservations*) [[ "$*" == *cr-test5* ]] && echo failed || echo active;;
  *create-capacity-reservation*)
    echo $((n+1)) > "$st"
    cnt=$(sed -n 's/.*--instance-count \([0-9]*\).*/\1/p' <<<"$*")
@@ -26,6 +27,7 @@ chmod +x "$tmp/bin/aws"
 out=$(cd "$tmp" && FAKE_STATE="$tmp/s1" PATH="$tmp/bin:$PATH" timeout 60 "$here/grab-gpu.sh" -r zz-test-1 -t g6e.12xlarge -n 4 -i 1 --max-interval 2 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"DONE: reserved 4"* ]] && ok "retries + halving reach the target" || { bad "retries + halving (rc=$rc)"; echo "$out"; }
 [[ "$out" == *"next try in"* ]] && ok "waits between rounds" || bad "waits between rounds"
+[[ "$out" == *"cr-test5 ended as failed"* && "$out" != *"(cr-test5)"* ]] && ok "a reservation that ends as failed is not counted" || { bad "failed reservation counted"; echo "$out"; }
 
 # Fake 2: quota error must stop at once with exit 3.
 cat > "$tmp/bin/aws" <<'F'

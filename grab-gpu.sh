@@ -121,6 +121,23 @@ START=$(date +%s)
 ROUND=0
 GOT=()
 
+# wait_active ID -> 0 when the reservation is active, 1 if it failed / never got active
+wait_active() {
+  local id="$1" st i
+  for i in $(seq 1 30); do
+    st=$(aws ec2 describe-capacity-reservations --region "$REGION" --capacity-reservation-ids "$id" \
+          --query 'CapacityReservations[0].State' --output text 2>/dev/null)
+    case "$st" in
+      active) return 0;;
+      failed|cancelled|expired) log "reservation $id ended as $st, retrying later"; return 1;;
+    esac
+    sleep 2
+  done
+  log "reservation $id still '$st' after 60s, cancelling it and retrying later"
+  aws ec2 cancel-capacity-reservation --region "$REGION" --capacity-reservation-id "$id" >/dev/null 2>&1
+  return 1
+}
+
 # try_reserve TYPE AZ COUNT -> 0 ok, 1 no capacity (retry later), 2 fatal
 try_reserve() {
   local t="$1" z="$2" c="$3" out rc
@@ -130,9 +147,11 @@ try_reserve() {
               --tag-specifications "ResourceType=capacity-reservation,Tags=[{Key=grab-gpu,Value=$TAG}]"
               --query 'CapacityReservation.CapacityReservationId' --output text)
   [[ $DRY_RUN -eq 1 ]] && args+=(--dry-run)
-  out=$(aws "${args[@]}" 2>&1); rc=$?
+  # AWS_MAX_ATTEMPTS=1: no hidden CLI retries, our own backoff sets the pace
+  out=$(AWS_MAX_ATTEMPTS=1 aws "${args[@]}" 2>&1); rc=$?
   if [[ $rc -eq 0 ]]; then
-    LAST_ID="$out"; return 0
+    LAST_ID="$out"
+    wait_active "$out"; return $?
   fi
   case "$out" in
     *DryRunOperation*) LAST_ID="dry-run"; return 0;;
